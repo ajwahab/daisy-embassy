@@ -452,6 +452,7 @@ version = "0.5.1"
 source = "git+https://github.com/embassy-rs/embassy.git?rev=70aa65871e26f087e0baaf8e737371a4d5fd6d20#70aa65871e26f087e0baaf8e737371a4d5fd6d20"
 dependencies = [
  "bitflags 2.10.0",
+ "defmt 1.0.1",
  "embassy-futures",
  "embassy-net-driver-channel",
  "embassy-sync",

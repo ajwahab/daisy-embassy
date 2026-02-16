@@ -33,7 +33,7 @@ defmt-rtt = "1.0.0"
 panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 embassy-executor = { version = "0.7.0", features = ["task-arena-size-32768", "arch-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
 embassy-futures = "0.1.2"
-embassy-usb = "0.5.1"
+embassy-usb = {version = "0.5.1", features = ["defmt"]}
 # these are for developing usb_uac example
 # embassy-executor = { path = "../_third_party/embassy/embassy-executor", features = ["task-arena-size-32768", "arch-cortex-m", "executor-thread", "executor-interrupt", "defmt", "integrated-timers"] }
 # embassy-futures = { path = "../_third_party/embassy/embassy-futures" }
