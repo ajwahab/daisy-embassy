@@ -2,7 +2,8 @@ use embassy_stm32::{
     self as hal, Peri, peripherals,
     sai::{
         self, BitOrder, ClockStrobe, DataSize, FifoThreshold, FrameSyncOffset, FrameSyncPolarity,
-        Mode, StereoMono, SyncInput, TxRx,
+        Mode, SlotSize, StereoMono, SyncInput, TxRx,
+        word::{U4, U7},
     },
     time::Hertz,
 };
@@ -18,8 +19,8 @@ const I2C_FS: Hertz = Hertz(100_000);
 /// A simple HAL for the Cirrus Logic/ Wolfson WM8731 audio codec
 pub struct Codec<'a> {
     i2c: hal::i2c::I2c<'a, hal::mode::Blocking, hal::i2c::Master>,
-    sai_tx: sai::Sai<'a, peripherals::SAI1, u32>,
-    sai_rx: sai::Sai<'a, peripherals::SAI1, u32>,
+    sai_tx: sai::Sai<'a, peripherals::SAI1, u8>,
+    sai_rx: sai::Sai<'a, peripherals::SAI1, u8>,
     pub sai_tx_config: sai::Config,
     pub sai_rx_config: sai::Config,
 }
@@ -28,8 +29,8 @@ impl<'a> Codec<'a> {
     pub async fn new(
         p: AudioPeripherals<'a>,
         audio_config: AudioConfig,
-        tx_buffer: &'a mut [u32],
-        rx_buffer: &'a mut [u32],
+        tx_buffer: &'a mut [u8],
+        rx_buffer: &'a mut [u8],
     ) -> Self {
         info!("set up i2c");
         let mut i2c_config = hal::i2c::Config::default();
@@ -50,13 +51,16 @@ impl<'a> Codec<'a> {
         sai_rx_config.clock_strobe = ClockStrobe::Falling;
         sai_rx_config.master_clock_divider = audio_config.fs.into_clock_divider();
         sai_rx_config.stereo_mono = StereoMono::Stereo;
-        sai_rx_config.data_size = DataSize::Data24;
+        sai_rx_config.data_size = DataSize::Data8;
         sai_rx_config.bit_order = BitOrder::MsbFirst;
         sai_rx_config.frame_sync_polarity = FrameSyncPolarity::ActiveHigh;
         sai_rx_config.frame_sync_offset = FrameSyncOffset::OnFirstBit;
         sai_rx_config.frame_length = 64;
-        sai_rx_config.frame_sync_active_level_length = embassy_stm32::sai::word::U7(32);
-        sai_rx_config.fifo_threshold = FifoThreshold::Quarter;
+        sai_rx_config.frame_sync_active_level_length = U7(32);
+        sai_rx_config.fifo_threshold = FifoThreshold::ThreeQuarters;
+        sai_rx_config.slot_count = U4(6);
+        sai_rx_config.slot_size = SlotSize::DataSize;
+        sai_rx_config.slot_enable = 0b111111;
 
         let mut sai_tx_config = sai_rx_config;
         sai_tx_config.mode = Mode::Slave;
@@ -224,18 +228,18 @@ impl<'a> Codec<'a> {
     pub fn release(
         self,
     ) -> (
-        sai::Sai<'a, SAI1, u32>,
-        sai::Sai<'a, SAI1, u32>,
+        sai::Sai<'a, SAI1, u8>,
+        sai::Sai<'a, SAI1, u8>,
         hal::i2c::I2c<'a, hal::mode::Blocking, hal::i2c::Master>,
     ) {
         (self.sai_tx, self.sai_rx, self.i2c)
     }
 
-    pub async fn read(&mut self, read_buf: &mut [u32]) -> Result<(), sai::Error> {
+    pub async fn read(&mut self, read_buf: &mut [u8]) -> Result<(), sai::Error> {
         self.sai_rx.read(read_buf).await
     }
 
-    pub async fn write(&mut self, write_buf: &[u32]) -> Result<(), sai::Error> {
+    pub async fn write(&mut self, write_buf: &[u8]) -> Result<(), sai::Error> {
         self.sai_tx.write(write_buf).await
     }
 }

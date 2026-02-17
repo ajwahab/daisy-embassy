@@ -11,16 +11,16 @@ use hal::sai::{self, MasterClockDivider};
 // - global constants ---------------------------------------------------------
 
 pub const BLOCK_LENGTH: usize = 32; // 32 samples
-pub const HALF_DMA_BUFFER_LENGTH: usize = BLOCK_LENGTH * 2; //  2 channels
+pub const HALF_DMA_BUFFER_LENGTH: usize = BLOCK_LENGTH * 2 * 3; //  2 channels, 24-bits
 pub const DMA_BUFFER_LENGTH: usize = HALF_DMA_BUFFER_LENGTH * 2; //  2 half-blocks
 
 // - static data --------------------------------------------------------------
 
 //DMA buffer must be in special region. Refer https://embassy.dev/book/#_stm32_bdma_only_working_out_of_some_ram_regions
 #[unsafe(link_section = ".sram1_bss")]
-static TX_BUFFER: GroundedArrayCell<u32, DMA_BUFFER_LENGTH> = GroundedArrayCell::uninit();
+static TX_BUFFER: GroundedArrayCell<u8, DMA_BUFFER_LENGTH> = GroundedArrayCell::uninit();
 #[unsafe(link_section = ".sram1_bss")]
-static RX_BUFFER: GroundedArrayCell<u32, DMA_BUFFER_LENGTH> = GroundedArrayCell::uninit();
+static RX_BUFFER: GroundedArrayCell<u8, DMA_BUFFER_LENGTH> = GroundedArrayCell::uninit();
 
 // - Interrupts ---------------------------------------------------------------
 bind_interrupts!(pub struct AudioIrqs{
@@ -30,7 +30,7 @@ bind_interrupts!(pub struct AudioIrqs{
 
 // - types --------------------------------------------------------------------
 
-pub type InterleavedBlock = [u32; HALF_DMA_BUFFER_LENGTH];
+pub type InterleavedBlock = [u8; HALF_DMA_BUFFER_LENGTH];
 
 /// `AudioPeripherals` is a builder to make `Interface` safely.
 /// It ensures the correct pin mappings and DMA regions for
@@ -62,13 +62,13 @@ impl<'a> AudioPeripherals<'a> {
     /// - This method is async because `seed_1_1` requires I2C communication with the WM8731 codec.
     /// - The board revision is selected via Cargo features (`seed_1_1`, `seed_1_2`).
     pub async fn prepare_interface(self, audio_config: AudioConfig) -> Interface<'a, Idle> {
-        let tx_buffer: &mut [u32] = unsafe {
+        let tx_buffer: &mut [u8] = unsafe {
             TX_BUFFER.initialize_all_copied(0);
             let (ptr, len) = TX_BUFFER.get_ptr_len();
             core::slice::from_raw_parts_mut(ptr, len)
         };
 
-        let rx_buffer: &mut [u32] = unsafe {
+        let rx_buffer: &mut [u8] = unsafe {
             RX_BUFFER.initialize_all_copied(0);
             let (ptr, len) = RX_BUFFER.get_ptr_len();
             core::slice::from_raw_parts_mut(ptr, len)
@@ -166,8 +166,8 @@ impl<'a> Interface<'a, Idle> {
         self,
     ) -> Result<
         (
-            sai::Sai<'a, hal::peripherals::SAI1, u32>,
-            sai::Sai<'a, hal::peripherals::SAI1, u32>,
+            sai::Sai<'a, hal::peripherals::SAI1, u8>,
+            sai::Sai<'a, hal::peripherals::SAI1, u8>,
             hal::i2c::I2c<'a, hal::mode::Blocking, hal::i2c::Master>,
         ),
         sai::Error,
@@ -179,7 +179,7 @@ impl<'a> Interface<'a, Idle> {
 impl Interface<'_, Running> {
     pub async fn start_callback(
         &mut self,
-        mut callback: impl FnMut(&[u32], &mut [u32]),
+        mut callback: impl FnMut(&[u8], &mut [u8]),
     ) -> Result<Infallible, sai::Error> {
         info!("enter audio callback loop");
         let mut write_buf = [0; HALF_DMA_BUFFER_LENGTH];
@@ -223,7 +223,7 @@ impl Fs {
         };
         let kernel_clock = hal::rcc::frequency::<hal::peripherals::SAI1>().0;
         let mclk_div = (kernel_clock / (fs * CLOCK_RATIO)) as u8;
-        mclk_div_from_u8(mclk_div)
+        MasterClockDivider::from(mclk_div)
     }
 }
 
@@ -234,76 +234,5 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         AudioConfig { fs: Fs::Fs48000 }
-    }
-}
-
-//================================================
-
-const fn mclk_div_from_u8(v: u8) -> MasterClockDivider {
-    match v {
-        1 => MasterClockDivider::DIV1,
-        2 => MasterClockDivider::DIV2,
-        3 => MasterClockDivider::DIV3,
-        4 => MasterClockDivider::DIV4,
-        5 => MasterClockDivider::DIV5,
-        6 => MasterClockDivider::DIV6,
-        7 => MasterClockDivider::DIV7,
-        8 => MasterClockDivider::DIV8,
-        9 => MasterClockDivider::DIV9,
-        10 => MasterClockDivider::DIV10,
-        11 => MasterClockDivider::DIV11,
-        12 => MasterClockDivider::DIV12,
-        13 => MasterClockDivider::DIV13,
-        14 => MasterClockDivider::DIV14,
-        15 => MasterClockDivider::DIV15,
-        16 => MasterClockDivider::DIV16,
-        17 => MasterClockDivider::DIV17,
-        18 => MasterClockDivider::DIV18,
-        19 => MasterClockDivider::DIV19,
-        20 => MasterClockDivider::DIV20,
-        21 => MasterClockDivider::DIV21,
-        22 => MasterClockDivider::DIV22,
-        23 => MasterClockDivider::DIV23,
-        24 => MasterClockDivider::DIV24,
-        25 => MasterClockDivider::DIV25,
-        26 => MasterClockDivider::DIV26,
-        27 => MasterClockDivider::DIV27,
-        28 => MasterClockDivider::DIV28,
-        29 => MasterClockDivider::DIV29,
-        30 => MasterClockDivider::DIV30,
-        31 => MasterClockDivider::DIV31,
-        32 => MasterClockDivider::DIV32,
-        33 => MasterClockDivider::DIV33,
-        34 => MasterClockDivider::DIV34,
-        35 => MasterClockDivider::DIV35,
-        36 => MasterClockDivider::DIV36,
-        37 => MasterClockDivider::DIV37,
-        38 => MasterClockDivider::DIV38,
-        39 => MasterClockDivider::DIV39,
-        40 => MasterClockDivider::DIV40,
-        41 => MasterClockDivider::DIV41,
-        42 => MasterClockDivider::DIV42,
-        43 => MasterClockDivider::DIV43,
-        44 => MasterClockDivider::DIV44,
-        45 => MasterClockDivider::DIV45,
-        46 => MasterClockDivider::DIV46,
-        47 => MasterClockDivider::DIV47,
-        48 => MasterClockDivider::DIV48,
-        49 => MasterClockDivider::DIV49,
-        50 => MasterClockDivider::DIV50,
-        51 => MasterClockDivider::DIV51,
-        52 => MasterClockDivider::DIV52,
-        53 => MasterClockDivider::DIV53,
-        54 => MasterClockDivider::DIV54,
-        55 => MasterClockDivider::DIV55,
-        56 => MasterClockDivider::DIV56,
-        57 => MasterClockDivider::DIV57,
-        58 => MasterClockDivider::DIV58,
-        59 => MasterClockDivider::DIV59,
-        60 => MasterClockDivider::DIV60,
-        61 => MasterClockDivider::DIV61,
-        62 => MasterClockDivider::DIV62,
-        63 => MasterClockDivider::DIV63,
-        _ => panic!(),
     }
 }

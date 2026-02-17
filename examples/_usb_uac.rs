@@ -1,12 +1,13 @@
 #![no_std]
 #![no_main]
 
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use daisy_embassy::audio::HALF_DMA_BUFFER_LENGTH;
 use defmt::{panic, *};
 use embassy_executor::Spawner;
+use embassy_futures::select::{Either3, select3};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, interrupt, peripherals, timer, usb};
 use embassy_sync::blocking_mutex::Mutex;
@@ -21,7 +22,6 @@ use heapless::Vec;
 use micromath::F32Ext;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
-
 bind_interrupts!(struct Irqs {
     OTG_FS => usb::InterruptHandler<peripherals::USB_OTG_FS>;
 });
@@ -43,7 +43,7 @@ pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const FEEDBACK_COUNTER_TICK_RATE: u32 = 42_000_000;
 
 // Use 32 bit samples, which allow for a lot of (software) volume adjustment without degradation of quality.
-pub const SAMPLE_WIDTH: uac1::SampleWidth = uac1::SampleWidth::Width4Byte;
+pub const SAMPLE_WIDTH: uac1::SampleWidth = uac1::SampleWidth::Width3Byte;
 pub const SAMPLE_WIDTH_BIT: usize = SAMPLE_WIDTH.in_bit();
 pub const SAMPLE_SIZE: usize = SAMPLE_WIDTH as usize;
 pub const SAMPLE_SIZE_PER_S: usize = (SAMPLE_RATE_HZ as usize) * INPUT_CHANNEL_COUNT * SAMPLE_SIZE;
@@ -60,13 +60,15 @@ pub const USB_MAX_PACKET_SIZE: usize = 2 * USB_FRAME_SIZE;
 pub const USB_MAX_SAMPLE_COUNT: usize = USB_MAX_PACKET_SIZE / SAMPLE_SIZE;
 
 // The data type that is exchanged via the zero-copy channel (a sample vector).
-pub type SampleBlock = Vec<u32, USB_MAX_SAMPLE_COUNT>;
+const USB_MAX_SAMPLE_SZ: usize = USB_MAX_SAMPLE_COUNT * SAMPLE_SIZE;
+pub type SampleBlock = Vec<u8, USB_MAX_SAMPLE_SZ>;
 
 // Feedback is provided in 10.14 format for full-speed endpoints.
 pub const FEEDBACK_REFRESH_PERIOD: uac1::FeedbackRefresh = uac1::FeedbackRefresh::Period8Frames;
 const FEEDBACK_SHIFT: usize = 14;
 
 const TICKS_PER_SAMPLE: f32 = (FEEDBACK_COUNTER_TICK_RATE as f32) / (SAMPLE_RATE_HZ as f32);
+// const TICKS_PER_SAMPLE: u32 = FEEDBACK_COUNTER_TICK_RATE / SAMPLE_RATE_HZ;
 
 struct Disconnected {}
 
@@ -96,6 +98,7 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
         packet.clear();
 
         let value = (counter as f32 * feedback_factor).round() as u32;
+        // let value = counter * feedback_factor;
 
         packet.push(value as u8).unwrap();
         packet.push((value >> 8) as u8).unwrap();
@@ -116,7 +119,7 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
         let data_size = stream.read_packet(&mut usb_data).await?;
 
         let word_count = data_size / SAMPLE_SIZE;
-
+        // info!("data_size: {}, word_count: {}", data_size, word_count);
         if word_count * SAMPLE_SIZE == data_size {
             // Obtain a buffer from the channel
             let samples = sender.send().await;
@@ -124,20 +127,54 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
 
             for w in 0..word_count {
                 let byte_offset = w * SAMPLE_SIZE;
-                let sample = u32::from_le_bytes(
-                    usb_data[byte_offset..byte_offset + SAMPLE_SIZE]
-                        .try_into()
-                        .unwrap(),
-                );
-
+                // let sample = u32::from_le_bytes(
+                //     usb_data[byte_offset..byte_offset + SAMPLE_SIZE]
+                //         .try_into()
+                //         .unwrap(),
+                // );
                 // Fill the sample buffer with data.
-                samples.push(sample).unwrap();
+                // samples.push(sample).unwrap();
+
+                samples.push(usb_data[byte_offset]);
+                samples.push(usb_data[byte_offset + 1]);
+                samples.push(usb_data[byte_offset + 2]);
+                // samples.push(usb_data[byte_offset + 1]);
+                // samples.push(usb_data[byte_offset]);
             }
 
             sender.send_done();
         } else {
             debug!("Invalid USB buffer size of {}, skipped.", data_size);
         }
+    }
+}
+
+struct QCnt {
+    drop: u8,
+    pass: u8,
+}
+
+impl QCnt {
+    fn new() -> Self {
+        Self { drop: 0, pass: 0 }
+    }
+    fn update(&mut self, x: Result<(), u8>) {
+        match x {
+            Ok(()) => {
+                self.pass = self.pass.wrapping_add(1);
+                if self.drop != 0 {
+                    warn! {"dropped: {}", self.drop};
+                    self.drop = 0;
+                }
+            }
+            Err(_) => {
+                self.drop = self.drop.wrapping_add(1);
+                if self.pass != 0 {
+                    debug! {"passed: {}", self.pass};
+                    self.pass = 0;
+                }
+            }
+        };
     }
 }
 
@@ -152,33 +189,88 @@ async fn audio_receiver_task(
         .setup_and_release()
         .await
         .expect("sai setup error");
-    let mut queue = heapless::Vec::<u32, { USB_MAX_SAMPLE_COUNT * 16 }>::new();
-
+    let mut queue = heapless::Vec::<u8, { USB_MAX_SAMPLE_SZ * 16 }>::new();
+    let mut qcnt = QCnt::new();
+    let mut read_buf = [0; HALF_DMA_BUFFER_LENGTH];
+    let mut write_buf = [0; HALF_DMA_BUFFER_LENGTH];
     loop {
-        let mut read_buf = [0; HALF_DMA_BUFFER_LENGTH];
-        let mut write_buf = [0; HALF_DMA_BUFFER_LENGTH];
-        let _ = sai_rx.read(&mut read_buf).await; //discard received
-
-        if let Ok(samples) = usb_audio_receiver
-            .receive()
-            .with_timeout(Duration::from_micros(500))
-            .await
+        // let mut read_buf = [0; HALF_DMA_BUFFER_LENGTH];
+        // let mut write_buf = [0; HALF_DMA_BUFFER_LENGTH];
+        // let _ = sai_rx.read(&mut read_buf).await; //discard received
+        match select3(
+            usb_audio_receiver
+                .receive()
+                .with_timeout(Duration::from_micros(0)),
+            sai_tx.write(&write_buf),
+            sai_rx.read(&mut read_buf),
+        )
+        .await
         {
-            for smp in samples.iter() {
-                //compress to 24bit
-                let smp = smp >> 8;
-                defmt::unwrap!(queue.push(smp));
+            Either3::First(r) => {
+                if let Ok(samples) = r {
+                    for smp in samples.iter() {
+                        // let smp = smp >> 8;
+                        qcnt.update(queue.push(*smp));
+                    }
+                    usb_audio_receiver.receive_done();
+                };
+                // for buf in write_buf.iter_mut() {
+                //     if let Some(smp) = queue.pop() {
+                //         *buf = smp;
+                //     }
+                // }
+                if queue.len() >= write_buf.len() {
+                    for buf in write_buf.iter_mut() {
+                        *buf = queue.pop().unwrap();
+                    }
+                }
             }
-            usb_audio_receiver.receive_done();
-        }
-        for buf in write_buf.iter_mut() {
-            if let Some(smp) = queue.pop() {
-                *buf = smp;
+            Either3::Second(r) => {
+                if let Err(e) = r {
+                    trace!("{:?}", e);
+                }
+                // if queue.len() >= write_buf.len() {
+                //     for buf in write_buf.iter_mut() {
+                //         *buf = queue.pop().unwrap();
+                //     }
+                // }
             }
-        }
-        if let Err(e) = sai_tx.write(&write_buf).await {
-            warn!("sai write error: {:?}", e);
-        }
+            Either3::Third(_) => (),
+        };
+        // if let Ok(samples) = usb_audio_receiver
+        //     .receive()
+        //     .with_timeout(Duration::from_micros(500))
+        //     .await
+        // {
+        //     for smp in samples.iter() {
+        //         let smp = smp >> 8;
+        //         match queue.push(smp) {
+        //             Ok(()) => {
+        //                 passed += 1;
+        //                 if dropped != 0 {
+        //                     warn! {"dropped: {}", dropped};
+        //                     dropped = 0;
+        //                 }
+        //             }
+        //             Err(_) => {
+        //                 dropped += 1;
+        //                 if passed != 0 {
+        //                     debug! {"passed: {}", passed};
+        //                     passed = 0;
+        //                 }
+        //             }
+        //         }
+        //     }
+        //     usb_audio_receiver.receive_done();
+        // }
+        // for buf in write_buf.iter_mut() {
+        //     if let Some(smp) = queue.pop() {
+        //         *buf = smp;
+        //     }
+        // }
+        // if let Err(e) = sai_tx.write(&write_buf).await {
+        //     trace!("{:?}", e);
+        // }
     }
 }
 
@@ -189,6 +281,7 @@ async fn usb_streaming_task(
     mut sender: zerocopy_channel::Sender<'static, NoopRawMutex, SampleBlock>,
 ) {
     loop {
+        debug!("waiting for connection...");
         stream.wait_connection().await;
         _ = stream_handler(&mut stream, &mut sender).await;
     }
@@ -201,6 +294,8 @@ async fn usb_feedback_task(
 ) {
     let feedback_factor = ((1 << FEEDBACK_SHIFT) as f32 / TICKS_PER_SAMPLE)
         / 2.0_f32.powf(FEEDBACK_REFRESH_PERIOD as usize as f32);
+    // let feedback_factor: u32 =
+    //     ((1 << FEEDBACK_SHIFT) / TICKS_PER_SAMPLE) / FEEDBACK_REFRESH_PERIOD.frame_count() as u32;
     info!("Using a feedback factor of {}.", feedback_factor);
 
     loop {
@@ -282,6 +377,36 @@ fn TIM2() {
         LAST_TICKS.store(ticks, Ordering::Relaxed);
     }
 }
+// #[interrupt]
+// fn TIM2() {
+//     static LAST_TICKS: Mutex<CriticalSectionRawMutex, Cell<u32>> = Mutex::new(Cell::new(0));
+//     static FRAME_COUNT: Mutex<CriticalSectionRawMutex, Cell<usize>> = Mutex::new(Cell::new(0));
+
+//     critical_section::with(|cs| {
+//         // Read timer counter.
+//         let timer = TIMER.borrow(cs).borrow().as_ref().unwrap().regs_gp32();
+
+//         let status = timer.sr().read();
+
+//         const CHANNEL_INDEX: usize = 0;
+//         if status.ccif(CHANNEL_INDEX) {
+//             let ticks = timer.ccr(CHANNEL_INDEX).read();
+
+//             let frame_count = FRAME_COUNT.borrow(cs);
+//             let last_ticks = LAST_TICKS.borrow(cs);
+
+//             frame_count.set(frame_count.get() + 1);
+//             if frame_count.get() >= FEEDBACK_REFRESH_PERIOD.frame_count() {
+//                 frame_count.set(0);
+//                 FEEDBACK_SIGNAL.signal(ticks.wrapping_sub(last_ticks.get()));
+//                 last_ticks.set(ticks);
+//             }
+//         };
+
+//         // Clear trigger interrupt flag.
+//         timer.sr().modify(|r| r.set_tif(false));
+//     });
+// }
 
 // If you are trying this and your USB device doesn't connect, the most
 // common issues are the RCC config and vbus_detection
@@ -362,7 +487,7 @@ async fn main(spawner: Spawner) {
         &mut builder,
         state,
         USB_MAX_PACKET_SIZE as u16,
-        uac1::SampleWidth::Width4Byte,
+        uac1::SampleWidth::Width3Byte,
         &[SAMPLE_RATE_HZ],
         &AUDIO_CHANNELS,
         FEEDBACK_REFRESH_PERIOD,
