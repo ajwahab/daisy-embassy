@@ -51,7 +51,7 @@ pub const INPUT_CHANNEL_COUNT: usize = 2;
 
 // This example uses a fixed sample rate of 48 kHz.
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
-pub const FEEDBACK_COUNTER_TICK_RATE: u32 = 48_000_000;
+pub const FEEDBACK_COUNTER_TICK_RATE: u32 = 120_000_000;
 
 // Use 32 bit samples, which allow for a lot of (software) volume adjustment without degradation of quality.
 pub const SAMPLE_WIDTH: uac1::SampleWidth = uac1::SampleWidth::Width4Byte;
@@ -130,6 +130,8 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
     let mut remainder = 0.0f32;
 
     info!("feedback handler started");
+    // Clear any existing FB value to make sure we don't start on the wrong frame
+    let _ = FEEDBACK_SIGNAL.try_take();
     loop {
         let counter = FEEDBACK_SIGNAL.wait().await;
 
@@ -267,8 +269,7 @@ async fn usb_streaming_task(
 async fn usb_feedback_task(
     mut feedback: speaker::Feedback<'static, usb::Driver<'static, peripherals::USB_OTG_FS>>,
 ) {
-    let feedback_factor = ((1 << FEEDBACK_SHIFT) as f32 / TICKS_PER_SAMPLE)
-        / FEEDBACK_REFRESH_PERIOD.frame_count() as f32;
+    let feedback_factor = (1 << FEEDBACK_SHIFT) as f32 / TICKS_PER_SAMPLE;
     info!("Using a feedback factor of {}.", feedback_factor);
 
     loop {
@@ -326,8 +327,6 @@ async fn usb_control_task(control_monitor: speaker::ControlMonitor<'static>) {
 /// requires wiring the MCLK output to the timer clock input.
 #[interrupt]
 fn TIM2() {
-    static LAST_TICKS: AtomicU32 = AtomicU32::new(0);
-
     // Count up frames and emit a signal, when the refresh period is reached.
     let regs = pac::USB_OTG_FS;
     critical_section::with(|cs| {
@@ -335,11 +334,10 @@ fn TIM2() {
         let timer = guard.as_mut().unwrap();
         if timer.get_input_interrupt(TIMER_CHANNEL) {
             let frame_number = regs.dsts().read().fnsof();
+            // Send the signal one frame before the feedback will be requested
             if (frame_number + 1) % FEEDBACK_REFRESH_PERIOD.frame_count() as u16 == 0 {
                 let ticks = timer.get_capture_value(TIMER_CHANNEL);
-                let last_ticks = LAST_TICKS.load(Ordering::Relaxed);
-                FEEDBACK_SIGNAL.signal(ticks.wrapping_sub(last_ticks));
-                LAST_TICKS.store(ticks, Ordering::Relaxed);
+                FEEDBACK_SIGNAL.signal(ticks);
             }
             timer.clear_input_interrupt(TIMER_CHANNEL);
         }
@@ -451,12 +449,11 @@ async fn main(spawner: Spawner) {
     tim2.set_tick_freq(Hertz(FEEDBACK_COUNTER_TICK_RATE));
     //from RM0433 "Reference Manual" P.1682 Table338
     tim2.set_trigger_source(timer::low_level::TriggerSource::ITR6); // The USB SOF signal.
-    tim2.set_slave_mode(timer::low_level::SlaveMode::TRIGGER_MODE);
-    // tim2.regs_gp16().dier().modify(|r| r.set_tie(true)); // Enable the trigger interrupt.
+    tim2.set_slave_mode(timer::low_level::SlaveMode::RESET_MODE);
 
     tim2.set_input_ti_selection(TIMER_CHANNEL, timer::low_level::InputTISelection::TRC);
     tim2.set_input_capture_prescaler(TIMER_CHANNEL, 0);
-    tim2.set_input_capture_filter(TIMER_CHANNEL, timer::low_level::FilterValue::FCK_INT_N2);
+    tim2.set_input_capture_filter(TIMER_CHANNEL, timer::low_level::FilterValue::FCK_INT_N8);
     tim2.enable_channel(TIMER_CHANNEL, true);
     tim2.enable_input_interrupt(TIMER_CHANNEL, true);
 
