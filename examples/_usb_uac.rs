@@ -2,26 +2,23 @@
 #![no_main]
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use daisy_embassy::audio::{Idle, Interface};
 use daisy_embassy::led::UserLed;
 use defmt::{panic, *};
-use embassy_executor::InterruptExecutor;
 use embassy_executor::Spawner;
 use embassy_futures::yield_now;
-use embassy_stm32::interrupt::InterruptExt;
-use embassy_stm32::interrupt::Priority;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, interrupt, pac, peripherals, timer, usb};
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, TimeoutError, Timer, WithTimeout};
+use embassy_time::{Duration, WithTimeout};
 use embassy_usb::class::uac1;
 use embassy_usb::class::uac1::speaker::{self, Speaker};
 use embassy_usb::driver::EndpointError;
+use heapless::Vec;
 use micromath::F32Ext;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
@@ -30,13 +27,7 @@ bind_interrupts!(struct Irqs {
     OTG_FS => usb::InterruptHandler<peripherals::USB_OTG_FS>;
 });
 
-#[interrupt]
-unsafe fn UART5() {
-    unsafe { AUDIO_EXECUTOR.on_interrupt() }
-}
-
-static AUDIO_EXECUTOR: InterruptExecutor = InterruptExecutor::new();
-
+const TIMER_CHANNEL: timer::Channel = timer::Channel::Ch1;
 static TIMER: Mutex<
     CriticalSectionRawMutex,
     RefCell<Option<timer::low_level::Timer<peripherals::TIM2>>>,
@@ -51,7 +42,7 @@ pub const INPUT_CHANNEL_COUNT: usize = 2;
 
 // This example uses a fixed sample rate of 48 kHz.
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
-pub const FEEDBACK_COUNTER_TICK_RATE: u32 = 120_000_000;
+pub const FEEDBACK_COUNTER_TICK_RATE: u32 = 48_000_000;
 
 // Use 32 bit samples, which allow for a lot of (software) volume adjustment without degradation of quality.
 pub const SAMPLE_WIDTH: uac1::SampleWidth = uac1::SampleWidth::Width4Byte;
@@ -76,14 +67,7 @@ const FEEDBACK_SHIFT: usize = 14;
 
 const TICKS_PER_SAMPLE: f32 = (FEEDBACK_COUNTER_TICK_RATE as f32) / (SAMPLE_RATE_HZ as f32);
 
-// Feedback value should not more more than 1 from the ideal value
-const FEEDBACK_LIMIT_LOWER: f32 = ((((SAMPLE_RATE_HZ / 1000) - 1) << FEEDBACK_SHIFT) + 1) as f32;
-const FEEDBACK_LIMIT_UPPER: f32 = ((((SAMPLE_RATE_HZ / 1000) + 1) << FEEDBACK_SHIFT) - 1) as f32;
-
-const AUDIO_BUFF_SIZE: usize = USB_MAX_SAMPLE_COUNT * 2; //4 packets, 384 samples
-
-const TIMER_CHANNEL: timer::Channel = timer::Channel::Ch1;
-
+const AUDIO_BUFF_SIZE: usize = USB_FRAME_SIZE * 4;
 struct Disconnected {}
 
 impl From<EndpointError> for Disconnected {
@@ -95,24 +79,6 @@ impl From<EndpointError> for Disconnected {
     }
 }
 
-impl From<TimeoutError> for Disconnected {
-    fn from(_val: TimeoutError) -> Self {
-        Self {}
-    }
-}
-
-// Model values
-static STREAM_ACTIVE: AtomicBool = AtomicBool::new(false);
-static GAIN_L: AtomicI32 = AtomicI32::new(0);
-static GAIN_R: AtomicI32 = AtomicI32::new(0);
-
-// Reporting values
-static FEEDBACK_VALUE: AtomicU32 = AtomicU32::new(0);
-static FEEDBACK_COUNT: AtomicU32 = AtomicU32::new(0);
-static SAMPLES_RECEIVED: AtomicU32 = AtomicU32::new(0);
-static SAMPLES_CONSUMED: AtomicU32 = AtomicU32::new(0);
-static SAMPLES_MISSED: AtomicU32 = AtomicU32::new(0);
-
 /// Sends feedback messages to the host.
 ///
 /// The `feedback_factor` scales the timer's counter value so that the result is the number of samples that this device
@@ -122,45 +88,40 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
     feedback: &mut speaker::Feedback<'d, usb::Driver<'d, T>>,
     feedback_factor: f32,
 ) -> Result<(), Disconnected> {
-    // Number of samples processed per frame, based on the counter values.
-    // Set to the ideal value initially
-    let mut samples_per_frame: f32 = (((SAMPLE_RATE_HZ) << FEEDBACK_SHIFT) / 1000) as f32;
+    let mut packet: Vec<u8, 4> = Vec::new();
 
-    // Remainder from rounding the feedback value, added on to the next value so as not to lose it
-    let mut remainder = 0.0f32;
+    // Collects the fractional component of the feedback value that is lost by rounding.
+    let mut rest = 0.0_f32;
 
-    info!("feedback handler started");
     // Clear any existing FB value to make sure we don't start on the wrong frame
     let _ = FEEDBACK_SIGNAL.try_take();
     loop {
         let counter = FEEDBACK_SIGNAL.wait().await;
 
-        let new_samples_per_frame = (counter as f32 * feedback_factor)
-            .clamp(FEEDBACK_LIMIT_LOWER as f32, FEEDBACK_LIMIT_UPPER as f32);
+        packet.clear();
 
-        samples_per_frame += (new_samples_per_frame - samples_per_frame) * 0.1;
+        let raw_value = counter as f32 * feedback_factor + rest;
+        let value = raw_value.round();
+        rest = raw_value - value;
 
-        let feedback_value_exact = samples_per_frame + remainder;
-        let feedback_value_rounded = feedback_value_exact.floor();
-        remainder = feedback_value_exact - feedback_value_rounded;
-        let feedback_value_q14 = feedback_value_rounded as u32;
-        FEEDBACK_VALUE.store(feedback_value_q14, Ordering::Relaxed);
+        let value = value as u32;
+        packet.push(value as u8).unwrap();
+        packet.push((value >> 8) as u8).unwrap();
+        packet.push((value >> 16) as u8).unwrap();
 
-        // The timeout is necessary to prevent the packet from being queued up during the frame after the
-        // previous one was collected - and getting the wrong EONUM value
-        match feedback
-            .write_packet(&feedback_value_q14.to_le_bytes()[..3])
+        let Ok(res) = feedback
+            .write_packet(&packet)
+            // Short timeout to prevent queueing
             .with_timeout(Duration::from_micros(10))
             .await
-        {
-            Ok(res) => {
-                let r = res?;
-                FEEDBACK_COUNT.fetch_add(1, Ordering::Relaxed);
-                r
-            }
-            // timeout - ignore
-            Err(_) => {}
+        else {
+            // Ignore timeout. There was already an uncollected message in the FIFO.
+            // The previous message will be delivered next time the host polls for it
+            continue;
         };
+
+        res?; // Return on error
+        debug!("feedback sent {}", value);
     }
 }
 
@@ -169,20 +130,13 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
     stream: &mut speaker::Stream<'d, usb::Driver<'d, T>>,
     sender: &mut channel::Sender<'static, CriticalSectionRawMutex, i32, AUDIO_BUFF_SIZE>,
 ) -> Result<(), Disconnected> {
-    SAMPLES_RECEIVED.store(0, Ordering::Relaxed);
-    SAMPLES_CONSUMED.store(0, Ordering::Relaxed);
     info!("stream handler started");
 
     loop {
         let mut usb_data = [0u8; USB_MAX_PACKET_SIZE];
-        let data_size = stream
-            .read_packet(&mut usb_data)
-            .with_timeout(Duration::from_millis(2))
-            .await??;
+        let data_size = stream.read_packet(&mut usb_data).await?;
 
         let word_count = data_size / SAMPLE_SIZE;
-
-        SAMPLES_RECEIVED.fetch_add(word_count as u32, Ordering::Relaxed);
 
         for sample in usb_data
             .as_chunks::<SAMPLE_SIZE>()
@@ -193,7 +147,6 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
         {
             sender.send(sample).await;
         }
-        STREAM_ACTIVE.store(true, Ordering::Relaxed);
     }
 }
 
@@ -205,45 +158,19 @@ async fn audio_receiver_task(
     mut led: UserLed<'static>,
 ) {
     let mut interface = unwrap!(interface.start_interface().await);
-    let mut playing = false;
 
     loop {
         let Err(e) = interface
             .start_callback(|_input, output| {
-                let stream_active = STREAM_ACTIVE.load(Ordering::Relaxed);
-                match (playing, stream_active) {
-                    // Start condition - start playing as soon as buffer is sufficiantly full
-                    (false, true) => playing = receiver.len() > AUDIO_BUFF_SIZE / 2,
-                    // Stop condition - run out buffer then stop
-                    (true, false) => playing = receiver.len() > 0,
-                    _ => {}
-                }
-
-                if !playing {
-                    output.fill(0);
-                    return;
-                }
-
-                let gain_l = GAIN_L.load(Ordering::Relaxed) as i64;
-                let gain_r = GAIN_R.load(Ordering::Relaxed) as i64;
-
                 led.off();
-                for (i, os) in output.iter_mut().enumerate() {
+                for os in output.iter_mut() {
                     let sample = receiver.try_receive().unwrap_or_else(|_| {
-                        if stream_active {
-                            // Buffer Underrun!
-                            led.on();
-                            SAMPLES_MISSED.fetch_add(1, Ordering::Relaxed);
-                        }
+                        // Buffer Underrun!
+                        led.on();
                         Default::default()
                     });
-                    // Gain is q23, further 8 bit shift converts from 32 bit to 24 bit
-                    *os = match i % 2 {
-                        0 => (sample as i64 * gain_l) >> (23 + 8),
-                        _ => (sample as i64 * gain_r) >> (23 + 8),
-                    } as u32;
+                    *os = (sample >> 8) as u32;
                 }
-                SAMPLES_CONSUMED.fetch_add(output.len() as u32, Ordering::Relaxed);
             })
             .await;
 
@@ -260,7 +187,6 @@ async fn usb_streaming_task(
     loop {
         stream.wait_connection().await;
         _ = stream_handler(&mut stream, &mut sender).await;
-        STREAM_ACTIVE.store(false, Ordering::Relaxed);
     }
 }
 
@@ -294,19 +220,8 @@ async fn usb_control_task(control_monitor: speaker::ControlMonitor<'static>) {
         control_monitor.changed().await;
 
         for channel in AUDIO_CHANNELS {
-            let volume = control_monitor.volume(channel).unwrap();
-            info!("Volume changed to {} on channel {}.", volume, channel);
-
-            let gain = match volume {
-                speaker::Volume::Muted => 0.0,
-                speaker::Volume::DeciBel(db) => 10.0.powf(db / 20.0) * 8_388_608.0 + 0.5,
-            } as i32;
-
-            match channel {
-                uac1::Channel::LeftFront => GAIN_L.store(gain, Ordering::Relaxed),
-                uac1::Channel::RightFront => GAIN_R.store(gain, Ordering::Relaxed),
-                _ => {}
-            }
+            let _volume = control_monitor.volume(channel).unwrap();
+            // info!("Volume changed to {} on channel {}.", volume, channel);
         }
     }
 }
@@ -318,9 +233,9 @@ async fn usb_control_task(control_monitor: speaker::ControlMonitor<'static>) {
 ///
 /// Configured in this example with
 /// - a refresh period of 8 ms, and
-/// - a tick rate of 48 MHz.
+/// - a tick rate of 42 MHz.
 ///
-/// This gives an (ideal) counter value of 384,000 for every update of the `FEEDBACK_SIGNAL`.
+/// This gives an (ideal) counter value of 336.000 for every update of the `FEEDBACK_SIGNAL`.
 ///
 /// In this application, the timer is clocked by an internal clock source. A popular choice is to clock the timer from
 /// the MCLK output of the SAI peripheral, which allows the SAI peripheral to use an external clock. However, this
@@ -343,7 +258,6 @@ fn TIM2() {
         }
     });
 }
-
 // If you are trying this and your USB device doesn't connect, the most
 // common issues are the RCC config and vbus_detection
 //
@@ -428,7 +342,7 @@ async fn main(spawner: Spawner) {
         &mut builder,
         state,
         USB_MAX_PACKET_SIZE as u16,
-        SAMPLE_WIDTH,
+        uac1::SampleWidth::Width4Byte,
         &[SAMPLE_RATE_HZ],
         &AUDIO_CHANNELS,
         FEEDBACK_REFRESH_PERIOD,
@@ -461,24 +375,18 @@ async fn main(spawner: Spawner) {
 
     TIMER.lock(|p| p.borrow_mut().replace(tim2));
 
-    interrupt::TIM2.set_priority(Priority::P0);
     // Unmask the TIM2 interrupt.
     unsafe {
         cortex_m::peripheral::NVIC::unmask(interrupt::TIM2);
     }
 
-    let led = board.user_led;
-
-    // Launch tasks.
-    interrupt::UART5.set_priority(Priority::P4);
-    let spawner_high = AUDIO_EXECUTOR.start(interrupt::UART5);
-    unwrap!(spawner_high.spawn(usb_feedback_task(feedback)));
-    unwrap!(spawner_high.spawn(usb_streaming_task(stream, sender)));
-    unwrap!(spawner.spawn(audio_receiver_task(interface, receiver, led)));
-    unwrap!(spawner.spawn(usb_task(usb_device)));
+    // Launch USB audio tasks.
     unwrap!(spawner.spawn(usb_control_task(control_monitor)));
+    unwrap!(spawner.spawn(usb_streaming_task(stream, sender)));
+    unwrap!(spawner.spawn(usb_feedback_task(feedback)));
+    unwrap!(spawner.spawn(usb_task(usb_device)));
+    unwrap!(spawner.spawn(audio_receiver_task(interface, receiver, board.user_led)));
     unwrap!(spawner.spawn(background_task()));
-    unwrap!(spawner.spawn(reporting_task(receiver)));
 }
 
 #[embassy_executor::task]
@@ -486,24 +394,5 @@ async fn background_task() {
     loop {
         // Spin-wait to keep the CPU from sleeping - which causes current noise
         yield_now().await;
-    }
-}
-
-#[embassy_executor::task]
-async fn reporting_task(
-    receiver: channel::Receiver<'static, CriticalSectionRawMutex, i32, AUDIO_BUFF_SIZE>,
-) {
-    loop {
-        Timer::after_millis(100).await;
-        info!(
-            "buffer: {}, recv: {}, cons: {}, missed: {}, feedback value: {}: {}s/ms, fb count: {}",
-            receiver.len(),
-            SAMPLES_RECEIVED.load(Ordering::Relaxed),
-            SAMPLES_CONSUMED.load(Ordering::Relaxed),
-            SAMPLES_MISSED.load(Ordering::Relaxed),
-            FEEDBACK_VALUE.load(Ordering::Relaxed),
-            FEEDBACK_VALUE.load(Ordering::Relaxed) as f32 / (1 << FEEDBACK_SHIFT) as f32,
-            FEEDBACK_COUNT.load(Ordering::Relaxed),
-        );
     }
 }
