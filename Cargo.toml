@@ -15,10 +15,6 @@ categories = ["embedded"]
 embassy-stm32 = { version = "0.5.0", features = ["defmt", "stm32h750ib", "time-driver-tim5", "exti", "memory-x", "unstable-pac", "chrono"] }
 embassy-time = { version = "0.5.0", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768", "generic-queue-8"] }
 embassy-sync = { version = "0.7.2", features = ["defmt"] }
-# these are for developing usb_uac example
-# embassy-stm32 = { path = "../_third_party/embassy/embassy-stm32", features = ["defmt", "stm32h750ib", "time-driver-tim5", "exti", "memory-x", "unstable-pac", "chrono"] }
-# embassy-time = { path = "../_third_party/embassy/embassy-time", features = ["defmt", "defmt-timestamp-uptime", "tick-hz-32_768"] }
-# embassy-sync = { path = "../_third_party/embassy/embassy-sync", features = ["defmt"] }
 cortex-m = "0.7.7"
 static_cell = "2.1.1"
 defmt = "1.0.1"
@@ -34,10 +30,6 @@ panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 embassy-executor = { version = "0.7.0", features = ["task-arena-size-32768", "arch-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
 embassy-futures = "0.1.2"
 embassy-usb = {version = "0.5.1", features = ["defmt"]}
-# these are for developing usb_uac example
-# embassy-executor = { path = "../_third_party/embassy/embassy-executor", features = ["task-arena-size-32768", "arch-cortex-m", "executor-thread", "executor-interrupt", "defmt", "integrated-timers"] }
-# embassy-futures = { path = "../_third_party/embassy/embassy-futures" }
-# embassy-usb = { path = "../_third_party/embassy/embassy-usb" }
 critical-section = "1.2.0"
 heapless = { version = "0.8", default-features = false }
 micromath = "2.0.0"
@@ -99,5 +91,5 @@ name = "looper"
 path = "examples/looper.rs"
 [[example]]
 name = "usb_uac"
-path = "examples/_usb_uac.rs"
+path = "examples/usb_uac.rs"
 
