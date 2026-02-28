@@ -109,6 +109,8 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
         packet.push((value >> 8) as u8).unwrap();
         packet.push((value >> 16) as u8).unwrap();
 
+        // let packet = value.to_le_bytes();
+        // feedback.write_packet(&packet[0..3]).await?;
         let Ok(res) = feedback
             .write_packet(&packet)
             // Short timeout to prevent queueing
@@ -162,11 +164,11 @@ async fn audio_receiver_task(
     loop {
         let Err(e) = interface
             .start_callback(|_input, output| {
-                led.off();
+                // led.off();
                 for os in output.iter_mut() {
                     let sample = receiver.try_receive().unwrap_or_else(|_| {
                         // Buffer Underrun!
-                        led.on();
+                        // led.on();
                         Default::default()
                     });
                     *os = (sample >> 8) as u32;
