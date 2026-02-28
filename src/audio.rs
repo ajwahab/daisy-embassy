@@ -2,7 +2,7 @@ use core::convert::Infallible;
 use core::marker::PhantomData;
 
 use crate::codec::{Codec, Pins as CodecPins};
-use defmt::info;
+use defmt::trace;
 use embassy_stm32::{self as hal, Peri, bind_interrupts, dma};
 use grounded::uninit::GroundedArrayCell;
 
@@ -166,7 +166,7 @@ impl Interface<'_, Running> {
         &mut self,
         mut callback: impl FnMut(&[u32], &mut [u32]),
     ) -> Result<Infallible, sai::Error> {
-        info!("enter audio callback loop");
+        trace!("enter audio callback loop");
         let mut write_buf = [0; HALF_DMA_BUFFER_LENGTH];
         let mut read_buf = [0; HALF_DMA_BUFFER_LENGTH];
         loop {
@@ -208,7 +208,7 @@ impl Fs {
         };
         let kernel_clock = hal::rcc::frequency::<hal::peripherals::SAI1>().0;
         let mclk_div = (kernel_clock / (fs * CLOCK_RATIO)) as u8;
-        mclk_div_from_u8(mclk_div)
+        MasterClockDivider::from(mclk_div)
     }
 }
 
@@ -219,76 +219,5 @@ pub struct AudioConfig {
 impl Default for AudioConfig {
     fn default() -> Self {
         AudioConfig { fs: Fs::Fs48000 }
-    }
-}
-
-//================================================
-
-const fn mclk_div_from_u8(v: u8) -> MasterClockDivider {
-    match v {
-        1 => MasterClockDivider::DIV1,
-        2 => MasterClockDivider::DIV2,
-        3 => MasterClockDivider::DIV3,
-        4 => MasterClockDivider::DIV4,
-        5 => MasterClockDivider::DIV5,
-        6 => MasterClockDivider::DIV6,
-        7 => MasterClockDivider::DIV7,
-        8 => MasterClockDivider::DIV8,
-        9 => MasterClockDivider::DIV9,
-        10 => MasterClockDivider::DIV10,
-        11 => MasterClockDivider::DIV11,
-        12 => MasterClockDivider::DIV12,
-        13 => MasterClockDivider::DIV13,
-        14 => MasterClockDivider::DIV14,
-        15 => MasterClockDivider::DIV15,
-        16 => MasterClockDivider::DIV16,
-        17 => MasterClockDivider::DIV17,
-        18 => MasterClockDivider::DIV18,
-        19 => MasterClockDivider::DIV19,
-        20 => MasterClockDivider::DIV20,
-        21 => MasterClockDivider::DIV21,
-        22 => MasterClockDivider::DIV22,
-        23 => MasterClockDivider::DIV23,
-        24 => MasterClockDivider::DIV24,
-        25 => MasterClockDivider::DIV25,
-        26 => MasterClockDivider::DIV26,
-        27 => MasterClockDivider::DIV27,
-        28 => MasterClockDivider::DIV28,
-        29 => MasterClockDivider::DIV29,
-        30 => MasterClockDivider::DIV30,
-        31 => MasterClockDivider::DIV31,
-        32 => MasterClockDivider::DIV32,
-        33 => MasterClockDivider::DIV33,
-        34 => MasterClockDivider::DIV34,
-        35 => MasterClockDivider::DIV35,
-        36 => MasterClockDivider::DIV36,
-        37 => MasterClockDivider::DIV37,
-        38 => MasterClockDivider::DIV38,
-        39 => MasterClockDivider::DIV39,
-        40 => MasterClockDivider::DIV40,
-        41 => MasterClockDivider::DIV41,
-        42 => MasterClockDivider::DIV42,
-        43 => MasterClockDivider::DIV43,
-        44 => MasterClockDivider::DIV44,
-        45 => MasterClockDivider::DIV45,
-        46 => MasterClockDivider::DIV46,
-        47 => MasterClockDivider::DIV47,
-        48 => MasterClockDivider::DIV48,
-        49 => MasterClockDivider::DIV49,
-        50 => MasterClockDivider::DIV50,
-        51 => MasterClockDivider::DIV51,
-        52 => MasterClockDivider::DIV52,
-        53 => MasterClockDivider::DIV53,
-        54 => MasterClockDivider::DIV54,
-        55 => MasterClockDivider::DIV55,
-        56 => MasterClockDivider::DIV56,
-        57 => MasterClockDivider::DIV57,
-        58 => MasterClockDivider::DIV58,
-        59 => MasterClockDivider::DIV59,
-        60 => MasterClockDivider::DIV60,
-        61 => MasterClockDivider::DIV61,
-        62 => MasterClockDivider::DIV62,
-        63 => MasterClockDivider::DIV63,
-        _ => panic!(),
     }
 }

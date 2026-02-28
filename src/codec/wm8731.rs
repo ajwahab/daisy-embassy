@@ -2,18 +2,18 @@ use embassy_stm32::{
     self as hal, Peri, peripherals,
     sai::{
         self, BitOrder, ClockStrobe, DataSize, FifoThreshold, FrameSyncOffset, FrameSyncPolarity,
-        Mode, StereoMono, SyncInput, TxRx,
+        Mode, SlotSize, StereoMono, SyncInput, TxRx,
     },
     time::Hertz,
 };
 use hal::peripherals::*;
 
-use defmt::{info, unwrap};
+use defmt::{info, panic};
 use embassy_time::Timer;
 
 use crate::audio::{AudioConfig, AudioIrqs, AudioPeripherals, Fs};
 
-const I2C_FS: Hertz = Hertz(100_000);
+const I2C_FS: Hertz = Hertz(400_000);
 
 /// A simple HAL for the Cirrus Logic/ Wolfson WM8731 audio codec
 pub struct Codec<'a> {
@@ -57,6 +57,9 @@ impl<'a> Codec<'a> {
         sai_rx_config.frame_length = 64;
         sai_rx_config.frame_sync_active_level_length = embassy_stm32::sai::word::U7(32);
         sai_rx_config.fifo_threshold = FifoThreshold::Quarter;
+        sai_rx_config.slot_count = embassy_stm32::sai::word::U4(2);
+        sai_rx_config.slot_enable = 0b11;
+        sai_rx_config.slot_size = SlotSize::DataSize;
 
         let mut sai_tx_config = sai_rx_config;
         sai_tx_config.mode = Mode::Slave;
@@ -104,27 +107,24 @@ impl<'a> Codec<'a> {
         use wm8731::WM8731;
         info!("setup wm8731 from I2C");
 
-        Timer::after_micros(10).await;
-
         // reset
-        self.write_wm8731_reg(WM8731::reset());
-        Timer::after_micros(10).await;
+        self.write_wm8731_reg(WM8731::reset()).await;
 
         // wakeup
         self.write_wm8731_reg(WM8731::power_down(|w| {
             Self::final_power_settings(w);
             //output off before start()
             w.output().power_off();
-        }));
-        Timer::after_micros(10).await;
+        }))
+        .await;
 
         // disable input mute, set to 0dB gain
         self.write_wm8731_reg(WM8731::left_line_in(|w| {
             w.both().enable();
             w.mute().disable();
             w.volume().nearest_dB(0);
-        }));
-        Timer::after_micros(10).await;
+        }))
+        .await;
 
         // sidetone off; DAC selected; bypass off; line input selected; mic muted; mic boost off
         self.write_wm8731_reg(WM8731::analog_audio_path(|w| {
@@ -134,15 +134,15 @@ impl<'a> Codec<'a> {
             w.input_select().line_input();
             w.mute_mic().enable();
             w.mic_boost().disable();
-        }));
-        Timer::after_micros(10).await;
+        }))
+        .await;
 
         // disable DAC mute, deemphasis for 48k
         self.write_wm8731_reg(WM8731::digital_audio_path(|w| {
             w.dac_mut().disable();
             w.deemphasis().frequency_48();
-        }));
-        Timer::after_micros(10).await;
+        }))
+        .await;
 
         // nothing inverted, slave, 24-bits, MSB format
         self.write_wm8731_reg(WM8731::digital_audio_interface_format(|w| {
@@ -152,8 +152,8 @@ impl<'a> Codec<'a> {
             w.left_right_phase().data_when_daclrc_low();
             w.bit_length().bits_24();
             w.format().left_justified();
-        }));
-        Timer::after_micros(10).await;
+        }))
+        .await;
 
         // no clock division, normal mode
         self.write_wm8731_reg(WM8731::sampling(|w| {
@@ -180,25 +180,28 @@ impl<'a> Codec<'a> {
                 }
             }
             w.usb_normal().normal();
-        }));
-        Timer::after_micros(10).await;
+        }))
+        .await;
 
         // set active
-        self.write_wm8731_reg(WM8731::active().active());
-        Timer::after_micros(10).await;
+        self.write_wm8731_reg(WM8731::active().active()).await;
 
         //Note: WM8731's output not yet enabled.
     }
 
-    fn write_wm8731_reg(&mut self, r: wm8731::Register) {
+    async fn write_wm8731_reg(&mut self, r: wm8731::Register) {
         const AD: u8 = 0x1a; // or 0x1b if CSB is high
 
         // WM8731 has 16 bits registers.
         // The first 7 bits are for the addresses, and the rest 9 bits are for the "value"s.
         // Let's pack wm8731::Register into 16 bits.
-        let byte1: u8 = ((r.address << 1) & 0b1111_1110) | (((r.value >> 8) & 0b0000_0001) as u8);
-        let byte2: u8 = (r.value & 0b1111_1111) as u8;
-        unwrap!(self.i2c.blocking_write(AD, &[byte1, byte2]));
+        let mut b = r.value.to_be_bytes();
+        b[0] |= r.address << 1;
+        match self.i2c.blocking_write(AD, &b) {
+            Ok(()) => (),
+            Err(e) => panic!("{}", e),
+        };
+        Timer::after_micros(10).await;
     }
 
     fn final_power_settings(w: &mut wm8731::power_down::PowerDown) {
@@ -214,8 +217,8 @@ impl<'a> Codec<'a> {
 
     pub async fn start(&mut self) -> Result<(), sai::Error> {
         info!("start WM8731");
-        self.write_wm8731_reg(wm8731::WM8731::power_down(Self::final_power_settings));
-        embassy_time::Timer::after_micros(10).await;
+        self.write_wm8731_reg(wm8731::WM8731::power_down(Self::final_power_settings))
+            .await;
 
         info!("start SAI");
         self.sai_rx.start()

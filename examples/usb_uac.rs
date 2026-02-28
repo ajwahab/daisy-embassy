@@ -18,7 +18,6 @@ use embassy_time::{Duration, WithTimeout};
 use embassy_usb::class::uac1;
 use embassy_usb::class::uac1::speaker::{self, Speaker};
 use embassy_usb::driver::EndpointError;
-use heapless::Vec;
 use micromath::F32Ext;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
@@ -45,7 +44,7 @@ pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const FEEDBACK_COUNTER_TICK_RATE: u32 = 48_000_000;
 
 // Use 32 bit samples, which allow for a lot of (software) volume adjustment without degradation of quality.
-pub const SAMPLE_WIDTH: uac1::SampleWidth = uac1::SampleWidth::Width4Byte;
+pub const SAMPLE_WIDTH: uac1::SampleWidth = uac1::SampleWidth::Width3Byte;
 pub const SAMPLE_WIDTH_BIT: usize = SAMPLE_WIDTH.in_bit();
 pub const SAMPLE_SIZE: usize = SAMPLE_WIDTH as usize;
 pub const SAMPLE_SIZE_PER_S: usize = (SAMPLE_RATE_HZ as usize) * INPUT_CHANNEL_COUNT * SAMPLE_SIZE;
@@ -88,8 +87,6 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
     feedback: &mut speaker::Feedback<'d, usb::Driver<'d, T>>,
     feedback_factor: f32,
 ) -> Result<(), Disconnected> {
-    let mut packet: Vec<u8, 4> = Vec::new();
-
     // Collects the fractional component of the feedback value that is lost by rounding.
     let mut rest = 0.0_f32;
 
@@ -97,22 +94,14 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
     let _ = FEEDBACK_SIGNAL.try_take();
     loop {
         let counter = FEEDBACK_SIGNAL.wait().await;
-
-        packet.clear();
-
         let raw_value = counter as f32 * feedback_factor + rest;
         let value = raw_value.round();
         rest = raw_value - value;
 
         let value = value as u32;
-        packet.push(value as u8).unwrap();
-        packet.push((value >> 8) as u8).unwrap();
-        packet.push((value >> 16) as u8).unwrap();
-
-        // let packet = value.to_le_bytes();
-        // feedback.write_packet(&packet[0..3]).await?;
+        let packet = value.to_le_bytes();
         let Ok(res) = feedback
-            .write_packet(&packet)
+            .write_packet(&packet[0..3])
             // Short timeout to prevent queueing
             .with_timeout(Duration::from_micros(10))
             .await
@@ -123,7 +112,7 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
         };
 
         res?; // Return on error
-        debug!("feedback sent {}", value);
+        trace!("feedback sent {}", value);
     }
 }
 
@@ -137,14 +126,13 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
     loop {
         let mut usb_data = [0u8; USB_MAX_PACKET_SIZE];
         let data_size = stream.read_packet(&mut usb_data).await?;
-
         let word_count = data_size / SAMPLE_SIZE;
-
         for sample in usb_data
             .as_chunks::<SAMPLE_SIZE>()
             .0
-            .into_iter()
-            .map(|s| i32::from_le_bytes(*s))
+            .iter()
+            //     .map(|s| i32::from_le_bytes(*s))
+            .map(|s| i32::from_le_bytes([0, s[0], s[1], s[2]]))
             .take(word_count)
         {
             sender.send(sample).await;
@@ -164,19 +152,19 @@ async fn audio_receiver_task(
     loop {
         let Err(e) = interface
             .start_callback(|_input, output| {
-                // led.off();
+                led.off();
                 for os in output.iter_mut() {
                     let sample = receiver.try_receive().unwrap_or_else(|_| {
                         // Buffer Underrun!
-                        // led.on();
+                        led.on();
                         Default::default()
                     });
                     *os = (sample >> 8) as u32;
+                    // *os = sample;
                 }
             })
             .await;
-
-        error!("Audio Error {}", e);
+        trace!("Audio Error {}", e);
     }
 }
 
@@ -235,7 +223,7 @@ async fn usb_control_task(control_monitor: speaker::ControlMonitor<'static>) {
 ///
 /// Configured in this example with
 /// - a refresh period of 8 ms, and
-/// - a tick rate of 42 MHz.
+/// - a tick rate of 48 MHz.
 ///
 /// This gives an (ideal) counter value of 336.000 for every update of the `FEEDBACK_SIGNAL`.
 ///
@@ -252,7 +240,7 @@ fn TIM2() {
         if timer.get_input_interrupt(TIMER_CHANNEL) {
             let frame_number = regs.dsts().read().fnsof();
             // Send the signal one frame before the feedback will be requested
-            if (frame_number + 1) % FEEDBACK_REFRESH_PERIOD.frame_count() as u16 == 0 {
+            if (frame_number + 1).is_multiple_of(FEEDBACK_REFRESH_PERIOD.frame_count() as u16) {
                 let ticks = timer.get_capture_value(TIMER_CHANNEL);
                 FEEDBACK_SIGNAL.signal(ticks);
             }
@@ -344,7 +332,7 @@ async fn main(spawner: Spawner) {
         &mut builder,
         state,
         USB_MAX_PACKET_SIZE as u16,
-        uac1::SampleWidth::Width4Byte,
+        uac1::SampleWidth::Width3Byte,
         &[SAMPLE_RATE_HZ],
         &AUDIO_CHANNELS,
         FEEDBACK_REFRESH_PERIOD,
