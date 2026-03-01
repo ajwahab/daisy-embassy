@@ -57,6 +57,7 @@ heapless = { version = "0.8", default-features = false }
 micromath = "2.0.0"
 
 [features]
+default = ["seed_1_1"]
 seed = []
 seed_1_1 = []
 seed_1_2 = []
@@ -64,12 +65,18 @@ patch_sm = []
 # defmt = []
 
 [patch.crates-io]
-embassy-stm32 = { git = "https://github.com/embassy-rs/embassy.git", rev = "70aa65871e26f087e0baaf8e737371a4d5fd6d20" }
-embassy-time = { git = "https://github.com/embassy-rs/embassy.git", rev = "70aa65871e26f087e0baaf8e737371a4d5fd6d20" }
-embassy-sync = { git = "https://github.com/embassy-rs/embassy.git", rev = "70aa65871e26f087e0baaf8e737371a4d5fd6d20" }
+# embassy-stm32 = { git = "https://github.com/embassy-rs/embassy.git", rev = "70aa65871e26f087e0baaf8e737371a4d5fd6d20" }
+# embassy-time = { git = "https://github.com/embassy-rs/embassy.git", rev = "70aa65871e26f087e0baaf8e737371a4d5fd6d20" }
+# embassy-sync = { git = "https://github.com/embassy-rs/embassy.git", rev = "70aa65871e26f087e0baaf8e737371a4d5fd6d20" }
 # embassy-executor = { git = "https://github.com/embassy-rs/embassy.git", rev = "70aa65871e26f087e0baaf8e737371a4d5fd6d20" }
-embassy-futures = { git = "https://github.com/embassy-rs/embassy.git", rev = "70aa65871e26f087e0baaf8e737371a4d5fd6d20" }
-embassy-usb = { git = "https://github.com/embassy-rs/embassy.git", rev = "70aa65871e26f087e0baaf8e737371a4d5fd6d20" }
+# embassy-futures = { git = "https://github.com/embassy-rs/embassy.git", rev = "70aa65871e26f087e0baaf8e737371a4d5fd6d20" }
+# embassy-usb = { git = "https://github.com/embassy-rs/embassy.git", rev = "70aa65871e26f087e0baaf8e737371a4d5fd6d20" }
+embassy-stm32 = { path = "../embassy/embassy-stm32" }
+embassy-time = { path = "../embassy/embassy-time" }
+embassy-sync = { path = "../embassy/embassy-sync" }
+# embassy-executor = { path = "../embassy/embassy-executor" }
+embassy-futures = { path = "../embassy/embassy-futures" }
+embassy-usb = { path = "../embassy/embassy-usb" }
 
 [profile.release]
 codegen-units = 1

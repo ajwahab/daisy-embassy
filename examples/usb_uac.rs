@@ -7,7 +7,10 @@ use daisy_embassy::audio::{Idle, Interface};
 use daisy_embassy::led::UserLed;
 use defmt::{panic, *};
 use embassy_executor::Spawner;
-use embassy_futures::yield_now;
+use embassy_futures::{
+    select::{Either, select},
+    yield_now,
+};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::{bind_interrupts, interrupt, pac, peripherals, timer, usb};
 use embassy_sync::blocking_mutex::Mutex;
@@ -16,6 +19,7 @@ use embassy_sync::channel;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, WithTimeout};
 use embassy_usb::class::uac1;
+use embassy_usb::class::uac1::microphone::{self, Microphone};
 use embassy_usb::class::uac1::speaker::{self, Speaker};
 use embassy_usb::driver::EndpointError;
 use micromath::F32Ext;
@@ -37,24 +41,29 @@ static TIMER: Mutex<
 pub static FEEDBACK_SIGNAL: Signal<CriticalSectionRawMutex, u32> = Signal::new();
 
 // Stereo input
-pub const INPUT_CHANNEL_COUNT: usize = 2;
+pub const PLAYBACK_CHANNEL_COUNT: usize = 2;
+// Mono output
+pub const CAPTURE_CHANNEL_COUNT: usize = 1;
 
 // This example uses a fixed sample rate of 48 kHz.
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 pub const FEEDBACK_COUNTER_TICK_RATE: u32 = 48_000_000;
 
-// Use 32 bit samples, which allow for a lot of (software) volume adjustment without degradation of quality.
+// Use 24-bit samples
 pub const SAMPLE_WIDTH: uac1::SampleWidth = uac1::SampleWidth::Width3Byte;
 pub const SAMPLE_WIDTH_BIT: usize = SAMPLE_WIDTH.in_bit();
 pub const SAMPLE_SIZE: usize = SAMPLE_WIDTH as usize;
-pub const SAMPLE_SIZE_PER_S: usize = (SAMPLE_RATE_HZ as usize) * INPUT_CHANNEL_COUNT * SAMPLE_SIZE;
+pub const SAMPLE_SIZE_PER_S: usize =
+    (SAMPLE_RATE_HZ as usize) * PLAYBACK_CHANNEL_COUNT * SAMPLE_SIZE;
 
 // Size of audio samples per 1 ms - for the full-speed USB frame period of 1 ms.
 pub const USB_FRAME_SIZE: usize = SAMPLE_SIZE_PER_S.div_ceil(1000);
 
 // Select front left and right audio channels.
-pub const AUDIO_CHANNELS: [uac1::Channel; INPUT_CHANNEL_COUNT] =
+pub const PLAYBACK_AUDIO_CHANNELS: [uac1::Channel; PLAYBACK_CHANNEL_COUNT] =
     [uac1::Channel::LeftFront, uac1::Channel::RightFront];
+pub const CAPTURE_AUDIO_CHANNELS: [uac1::Channel; CAPTURE_CHANNEL_COUNT] =
+    [uac1::Channel::CenterFront];
 
 // Factor of two as a margin for feedback (this is an excessive amount)
 pub const USB_MAX_PACKET_SIZE: usize = 2 * USB_FRAME_SIZE;
@@ -98,8 +107,7 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
         let value = raw_value.round();
         rest = raw_value - value;
 
-        let value = value as u32;
-        let packet = value.to_le_bytes();
+        let packet = (value as u32).to_le_bytes();
         let Ok(res) = feedback
             .write_packet(&packet[0..3])
             // Short timeout to prevent queueing
@@ -117,7 +125,7 @@ async fn feedback_handler<'d, T: usb::Instance + 'd>(
 }
 
 /// Handles streaming of audio data from the host.
-async fn stream_handler<'d, T: usb::Instance + 'd>(
+async fn playback_stream_handler<'d, T: usb::Instance + 'd>(
     stream: &mut speaker::Stream<'d, usb::Driver<'d, T>>,
     sender: &mut channel::Sender<'static, CriticalSectionRawMutex, i32, AUDIO_BUFF_SIZE>,
 ) -> Result<(), Disconnected> {
@@ -140,11 +148,27 @@ async fn stream_handler<'d, T: usb::Instance + 'd>(
     }
 }
 
+async fn capture_stream_handler<'d, T: usb::Instance + 'd>(
+    receiver: &mut channel::Receiver<'static, CriticalSectionRawMutex, i32, AUDIO_BUFF_SIZE>,
+    stream: &mut microphone::Stream<'d, usb::Driver<'d, T>>,
+) -> Result<(), Disconnected> {
+    let mut usb_data = [0u8; USB_MAX_PACKET_SIZE];
+    loop {
+        for sample in usb_data.as_chunks_mut::<SAMPLE_SIZE>().0.iter_mut() {
+            *sample = i32::to_le_bytes(receiver.receive().await)[0..SAMPLE_SIZE]
+                .try_into()
+                .unwrap();
+        }
+        stream.write_packet(usb_data.as_slice()).await?
+    }
+}
+
 /// Receives audio samples from the USB streaming task and can play them back.
 #[embassy_executor::task]
-async fn audio_receiver_task(
+async fn audio_relay_task(
     interface: Interface<'static, Idle>,
     receiver: channel::Receiver<'static, CriticalSectionRawMutex, i32, AUDIO_BUFF_SIZE>,
+    _sender: channel::Sender<'static, CriticalSectionRawMutex, i32, AUDIO_BUFF_SIZE>,
     mut led: UserLed<'static>,
 ) {
     let mut interface = unwrap!(interface.start_interface().await);
@@ -160,7 +184,7 @@ async fn audio_receiver_task(
                         Default::default()
                     });
                     *os = (sample >> 8) as u32;
-                    // *os = sample;
+                    // *os = sample as u32;
                 }
             })
             .await;
@@ -170,13 +194,25 @@ async fn audio_receiver_task(
 
 /// Receives audio samples from the host.
 #[embassy_executor::task]
-async fn usb_streaming_task(
+async fn usb_playback_task(
     mut stream: speaker::Stream<'static, usb::Driver<'static, peripherals::USB_OTG_FS>>,
     mut sender: channel::Sender<'static, CriticalSectionRawMutex, i32, AUDIO_BUFF_SIZE>,
 ) {
     loop {
         stream.wait_connection().await;
-        _ = stream_handler(&mut stream, &mut sender).await;
+        _ = playback_stream_handler(&mut stream, &mut sender).await;
+    }
+}
+
+/// Sends audio samples to the host.
+#[embassy_executor::task]
+async fn usb_capture_task(
+    mut receiver: channel::Receiver<'static, CriticalSectionRawMutex, i32, AUDIO_BUFF_SIZE>,
+    mut stream: microphone::Stream<'static, usb::Driver<'static, peripherals::USB_OTG_FS>>,
+) {
+    loop {
+        stream.wait_connection().await;
+        _ = capture_stream_handler(&mut receiver, &mut stream).await;
     }
 }
 
@@ -205,13 +241,24 @@ async fn usb_task(
 ///
 /// In this case, monitor changes of volume or mute state.
 #[embassy_executor::task]
-async fn usb_control_task(control_monitor: speaker::ControlMonitor<'static>) {
+async fn usb_control_task(
+    playback_control: speaker::ControlMonitor<'static>,
+    capture_control: microphone::ControlMonitor<'static>,
+) {
     loop {
-        control_monitor.changed().await;
-
-        for channel in AUDIO_CHANNELS {
-            let _volume = control_monitor.volume(channel).unwrap();
-            // info!("Volume changed to {} on channel {}.", volume, channel);
+        match select(playback_control.changed(), capture_control.changed()).await {
+            Either::First(_) => {
+                for channel in PLAYBACK_AUDIO_CHANNELS {
+                    let _volume = playback_control.volume(channel).unwrap();
+                    // info!("Volume changed to {} on channel {}.", volume, channel);
+                }
+            }
+            Either::Second(_) => {
+                for channel in CAPTURE_AUDIO_CHANNELS {
+                    let _volume = capture_control.volume(channel).unwrap();
+                    // info!("Volume changed to {} on channel {}.", volume, channel);
+                }
+            }
         }
     }
 }
@@ -284,9 +331,6 @@ async fn main(spawner: Spawner) {
     let ep_out_buffer =
         EP_OUT_BUFFER.init([0u8; FEEDBACK_BUF_SIZE + CONTROL_BUF_SIZE + USB_MAX_PACKET_SIZE]);
 
-    static STATE: StaticCell<speaker::State> = StaticCell::new();
-    let state = STATE.init(speaker::State::new());
-
     // Create the driver, from the HAL.
     let mut usb_config = usb::Config::default();
 
@@ -308,7 +352,7 @@ async fn main(spawner: Spawner) {
     // Basic USB device configuration
     let mut config = embassy_usb::Config::new(0xdead, 0xbeef);
     config.manufacturer = Some("Embassy");
-    config.product = Some("USB-audio-speaker example");
+    config.product = Some("USB-audio-duplex example");
     config.serial_number = Some("12345678");
 
     // Required for windows compatibility.
@@ -328,25 +372,48 @@ async fn main(spawner: Spawner) {
     );
 
     // Create the UAC1 Speaker class components
-    let (stream, feedback, control_monitor) = Speaker::new(
-        &mut builder,
-        state,
-        USB_MAX_PACKET_SIZE as u16,
-        uac1::SampleWidth::Width3Byte,
-        &[SAMPLE_RATE_HZ],
-        &AUDIO_CHANNELS,
-        FEEDBACK_REFRESH_PERIOD,
-    );
+    let (playback_stream, feedback, playback_control) = {
+        static STATE: StaticCell<speaker::State> = StaticCell::new();
+        Speaker::new(
+            &mut builder,
+            STATE.init(speaker::State::new()),
+            USB_MAX_PACKET_SIZE as u16,
+            uac1::SampleWidth::Width3Byte,
+            &[SAMPLE_RATE_HZ],
+            &PLAYBACK_AUDIO_CHANNELS,
+            FEEDBACK_REFRESH_PERIOD,
+        )
+    };
+
+    // Create the UAC1 Microphone class components
+    let (capture_stream, capture_control) = {
+        static STATE: StaticCell<microphone::State> = StaticCell::new();
+        Microphone::new(
+            &mut builder,
+            STATE.init(microphone::State::new()),
+            USB_MAX_PACKET_SIZE as u16,
+            uac1::SampleWidth::Width3Byte,
+            &[SAMPLE_RATE_HZ],
+            &CAPTURE_AUDIO_CHANNELS,
+        )
+    };
 
     // Create the USB device
     let usb_device = builder.build();
 
-    static AUDIO_CHANNEL: StaticCell<
+    static PLAYBACK_AUDIO_CHANNEL: StaticCell<
         channel::Channel<CriticalSectionRawMutex, i32, AUDIO_BUFF_SIZE>,
     > = StaticCell::new();
-    let channel = AUDIO_CHANNEL.init(channel::Channel::new());
-    let sender = channel.sender();
-    let receiver = channel.receiver();
+    let playback_channel = PLAYBACK_AUDIO_CHANNEL.init(channel::Channel::new());
+    let playback_sender = playback_channel.sender();
+    let playback_receiver = playback_channel.receiver();
+
+    static CAPTURE_AUDIO_CHANNEL: StaticCell<
+        channel::Channel<CriticalSectionRawMutex, i32, AUDIO_BUFF_SIZE>,
+    > = StaticCell::new();
+    let capture_channel = CAPTURE_AUDIO_CHANNEL.init(channel::Channel::new());
+    let capture_sender = capture_channel.sender();
+    let capture_receiver = capture_channel.receiver();
 
     // Run a timer for counting between SOF interrupts.
     let mut tim2 = timer::low_level::Timer::new(p.TIM2);
@@ -371,11 +438,17 @@ async fn main(spawner: Spawner) {
     }
 
     // Launch USB audio tasks.
-    unwrap!(spawner.spawn(usb_control_task(control_monitor)));
-    unwrap!(spawner.spawn(usb_streaming_task(stream, sender)));
+    unwrap!(spawner.spawn(usb_control_task(playback_control, capture_control)));
+    unwrap!(spawner.spawn(usb_playback_task(playback_stream, playback_sender)));
+    unwrap!(spawner.spawn(usb_capture_task(capture_receiver, capture_stream)));
     unwrap!(spawner.spawn(usb_feedback_task(feedback)));
     unwrap!(spawner.spawn(usb_task(usb_device)));
-    unwrap!(spawner.spawn(audio_receiver_task(interface, receiver, board.user_led)));
+    unwrap!(spawner.spawn(audio_relay_task(
+        interface,
+        playback_receiver,
+        capture_sender,
+        board.user_led
+    )));
     unwrap!(spawner.spawn(background_task()));
 }
 

@@ -49,7 +49,7 @@ impl<'a> Codec<'a> {
         sai_rx_config.sync_output = true;
         sai_rx_config.clock_strobe = ClockStrobe::Falling;
         sai_rx_config.master_clock_divider = audio_config.fs.into_clock_divider();
-        sai_rx_config.stereo_mono = StereoMono::Stereo;
+        sai_rx_config.stereo_mono = StereoMono::Mono;
         sai_rx_config.data_size = DataSize::Data24;
         sai_rx_config.bit_order = BitOrder::MsbFirst;
         sai_rx_config.frame_sync_polarity = FrameSyncPolarity::ActiveHigh;
@@ -58,7 +58,7 @@ impl<'a> Codec<'a> {
         sai_rx_config.frame_sync_active_level_length = embassy_stm32::sai::word::U7(32);
         sai_rx_config.fifo_threshold = FifoThreshold::Quarter;
         sai_rx_config.slot_count = embassy_stm32::sai::word::U4(2);
-        sai_rx_config.slot_enable = 0b11;
+        sai_rx_config.slot_enable = 0b01;
         sai_rx_config.slot_size = SlotSize::DataSize;
 
         let mut sai_tx_config = sai_rx_config;
@@ -67,6 +67,9 @@ impl<'a> Codec<'a> {
         sai_tx_config.sync_input = SyncInput::Internal;
         sai_tx_config.clock_strobe = ClockStrobe::Rising;
         sai_tx_config.sync_output = false;
+        sai_tx_config.stereo_mono = StereoMono::Stereo;
+        sai_tx_config.slot_enable = 0b11;
+        sai_tx_config.slot_size = SlotSize::DataSize;
 
         let sai_tx = hal::sai::Sai::new_synchronous(
             sub_block_tx,

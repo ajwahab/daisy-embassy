@@ -13,14 +13,17 @@ use hal::sai::{self, MasterClockDivider};
 pub const BLOCK_LENGTH: usize = 32; // 32 samples
 pub const HALF_DMA_BUFFER_LENGTH: usize = BLOCK_LENGTH * 2; //  2 channels
 pub const DMA_BUFFER_LENGTH: usize = HALF_DMA_BUFFER_LENGTH * 2; //  2 half-blocks
+pub const TX_DMA_BUFFER_LENGTH: usize = HALF_DMA_BUFFER_LENGTH * 2;
+pub const RX_HALF_DMA_BUFFER_LENGTH: usize = BLOCK_LENGTH; // 1 channel
+pub const RX_DMA_BUFFER_LENGTH: usize = RX_HALF_DMA_BUFFER_LENGTH * 2; //  2 half-blocks
 
 // - static data --------------------------------------------------------------
 
 //DMA buffer must be in special region. Refer https://embassy.dev/book/#_stm32_bdma_only_working_out_of_some_ram_regions
 #[unsafe(link_section = ".sram1_bss")]
-static TX_BUFFER: GroundedArrayCell<u32, DMA_BUFFER_LENGTH> = GroundedArrayCell::uninit();
+static TX_BUFFER: GroundedArrayCell<u32, TX_DMA_BUFFER_LENGTH> = GroundedArrayCell::uninit();
 #[unsafe(link_section = ".sram1_bss")]
-static RX_BUFFER: GroundedArrayCell<u32, DMA_BUFFER_LENGTH> = GroundedArrayCell::uninit();
+static RX_BUFFER: GroundedArrayCell<u32, RX_DMA_BUFFER_LENGTH> = GroundedArrayCell::uninit();
 
 // - Interrupts ---------------------------------------------------------------
 bind_interrupts!(pub struct AudioIrqs{
@@ -167,8 +170,8 @@ impl Interface<'_, Running> {
         mut callback: impl FnMut(&[u32], &mut [u32]),
     ) -> Result<Infallible, sai::Error> {
         trace!("enter audio callback loop");
-        let mut write_buf = [0; HALF_DMA_BUFFER_LENGTH];
-        let mut read_buf = [0; HALF_DMA_BUFFER_LENGTH];
+        let mut write_buf = [0; TX_DMA_BUFFER_LENGTH];
+        let mut read_buf = [0; RX_DMA_BUFFER_LENGTH];
         loop {
             self.codec.read(&mut read_buf).await?;
             callback(&read_buf, &mut write_buf);
